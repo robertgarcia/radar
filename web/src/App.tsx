@@ -217,6 +217,13 @@ function AppInner() {
   // Get mainView from URL path
   const mainView = getViewFromPath(location.pathname)
 
+  // `/resources` vs `/resources/pods` — both mean Pods; `/resources/deployments` etc. switches workload kind.
+  const normalizedResourcesKindSlug = useMemo(() => {
+    const m = location.pathname.match(/^\/resources(?:\/([^/]+))?/)
+    const slug = m?.[1] ?? ''
+    return slug || 'pods'
+  }, [location.pathname])
+
   // Set mainView by navigating to the path
   const setMainView = useCallback((view: ExtendedMainView, params?: Record<string, string>) => {
     const path = view === 'home' ? '/' : `/${view}`
@@ -291,6 +298,23 @@ function AppInner() {
 
   // Suppress the mainView-change clear effect during controlled expand/collapse transitions.
   const suppressViewClearRef = useRef(false)
+
+  // Close resource drawer when switching workload kind in URL (/resources/pods → /resources/deployments).
+  // Keeps stale Pod drawer from masking the table after sidebar navigation (Radar Hub / app.radarhq.io).
+  const prevResourcesKindSlugRef = useRef<string | null>(null)
+  useEffect(() => {
+    if (mainView !== 'resources') {
+      prevResourcesKindSlugRef.current = null
+      return
+    }
+    const slug = normalizedResourcesKindSlug
+    const prev = prevResourcesKindSlugRef.current
+    prevResourcesKindSlugRef.current = slug
+    if (prev !== null && prev !== slug) {
+      setSelectedResource(null)
+      setDrawerExpanded(false)
+    }
+  }, [mainView, normalizedResourcesKindSlug])
 
   // Animation hooks for smooth mount/unmount transitions
   const resourceDrawer = useAnimatedUnmount(!!selectedResource, 300)

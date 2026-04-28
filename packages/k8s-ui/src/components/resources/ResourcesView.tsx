@@ -1695,8 +1695,20 @@ function getInitialKindFromURL(
   locationPathname?: string,
   locationSearch?: string,
 ): SelectedKindInfo {
-  const pathname = locationPathname || window.location.pathname
-  const search = locationSearch || window.location.search
+  // Prefer injected pathname/search from the host router. Using `||` would incorrectly fall back to
+  // window when the host passes '' before hydration. SSR has no window.
+  const pathname =
+    locationPathname !== undefined
+      ? locationPathname
+      : typeof window !== 'undefined'
+        ? window.location.pathname
+        : ''
+  const search =
+    locationSearch !== undefined
+      ? locationSearch
+      : typeof window !== 'undefined'
+        ? window.location.search
+        : ''
   const base = basePath.replace(/\/$/, '') // strip trailing slash
   let kind: string | null = null
   if (pathname.startsWith(base + '/')) {
@@ -1772,7 +1784,7 @@ export function ResourcesView({
     if (kindFromURL.name !== selectedKind.name || kindFromURL.group !== selectedKind.group) {
       setSelectedKind(kindFromURL)
     }
-  }, [locationPathname]) // eslint-disable-line react-hooks/exhaustive-deps
+  }, [locationPathname, locationSearch]) // eslint-disable-line react-hooks/exhaustive-deps
   // Notify parent of selected kind changes (including initial mount)
   useEffect(() => {
     onSelectedKindChange?.(selectedKind)

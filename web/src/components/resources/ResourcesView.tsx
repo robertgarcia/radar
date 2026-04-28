@@ -160,6 +160,7 @@ export function ResourcesView({ namespaces, selectedResource, onResourceClick, o
   return (
     <>
     <BaseResourcesView
+      key={location.pathname}
       namespaces={namespaces}
       selectedResource={selectedResource}
       onResourceClick={onResourceClick}
