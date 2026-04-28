@@ -217,6 +217,23 @@ function AppInner() {
   // Get mainView from URL path
   const mainView = getViewFromPath(location.pathname)
 
+  // Workload slug after `/resources/` (defaults to `pods`). Bare `/resources` redirects to `/resources/pods`.
+  const normalizedResourcesKindSlug = useMemo(() => {
+    const m = location.pathname.match(/^\/resources(?:\/([^/]+))?/)
+    const slug = m?.[1] ?? ''
+    return slug || 'pods'
+  }, [location.pathname])
+
+  // Canonical URL — `/resources` is not stable for bookmarks/sharing; normalize to `/resources/pods`.
+  useEffect(() => {
+    const path = location.pathname.replace(/\/+$/, '') || '/'
+    if (path !== '/resources') return
+    navigate(
+      { pathname: '/resources/pods', search: location.search, hash: location.hash },
+      { replace: true },
+    )
+  }, [location.pathname, location.search, location.hash, navigate])
+
   // Set mainView by navigating to the path
   const setMainView = useCallback((view: ExtendedMainView, params?: Record<string, string>) => {
     const path = view === 'home' ? '/' : `/${view}`
@@ -291,6 +308,23 @@ function AppInner() {
 
   // Suppress the mainView-change clear effect during controlled expand/collapse transitions.
   const suppressViewClearRef = useRef(false)
+
+  // Close resource drawer when switching workload kind in URL (/resources/pods → /resources/deployments).
+  // Keeps stale Pod drawer from masking the table after sidebar navigation (Radar Hub / app.radarhq.io).
+  const prevResourcesKindSlugRef = useRef<string | null>(null)
+  useEffect(() => {
+    if (mainView !== 'resources') {
+      prevResourcesKindSlugRef.current = null
+      return
+    }
+    const slug = normalizedResourcesKindSlug
+    const prev = prevResourcesKindSlugRef.current
+    prevResourcesKindSlugRef.current = slug
+    if (prev !== null && prev !== slug) {
+      setSelectedResource(null)
+      setDrawerExpanded(false)
+    }
+  }, [mainView, normalizedResourcesKindSlug])
 
   // Animation hooks for smooth mount/unmount transitions
   const resourceDrawer = useAnimatedUnmount(!!selectedResource, 300)
