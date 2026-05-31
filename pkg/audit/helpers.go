@@ -1,21 +1,16 @@
 package audit
 
 import (
-	"fmt"
 	"sort"
 	"strings"
+
+	"github.com/skyhook-io/radar/pkg/resourceid"
 )
 
-// ResourceKey returns the index key for a resource:
-// "group|Kind|namespace|name". Group goes first because both group and
-// namespace can legitimately be empty independently — encoding group
-// last would leave a cluster-scoped CRD key ambiguous with a
-// namespaced core-group key under any 3-part parse. "|" is a safe
-// delimiter — Kubernetes API groups follow DNS subdomain rules and
-// can't contain it. Mirrors the same shape as the issue-source key in
-// internal/summarycontext.
+// ResourceKey re-exports the neutral identity key from pkg/resourceid (the
+// canonical home) so existing audit callers keep working unchanged.
 func ResourceKey(group, kind, namespace, name string) string {
-	return fmt.Sprintf("%s|%s|%s|%s", group, kind, namespace, name)
+	return resourceid.ResourceKey(group, kind, namespace, name)
 }
 
 // IndexByResource builds a lookup map from ResourceKey → []Finding.
@@ -67,38 +62,6 @@ func GroupByResource(findings []Finding) []ResourceGroup {
 	return groups
 }
 
-// GroupForBuiltinKind maps a built-in Kubernetes Kind to the API group
-// the audit suite scans it under. Returns "" for kinds the suite
-// doesn't recognize — those don't get a populated Finding.Group, which
-// means cross-group collision risk is bounded to the listed built-ins
-// vs. third-party CRDs sharing the same Kind name.
-//
-// Kept here (next to ResourceKey) so the Kind→Group mapping lives in
-// one place rather than every Finding{} emission site. buildResults
-// populates Finding.Group via this helper before the index is built;
-// per-check code stays terse and group-agnostic.
-//
-// Also reused by internal/issues to resolve Group on Problem-sourced
-// rows that pre-date group-aware emission — keeps the (Kind→Group)
-// table in one place across packages.
-func GroupForBuiltinKind(kind string) string {
-	switch kind {
-	case "Pod", "Service", "ConfigMap", "Secret", "Node", "Namespace",
-		"PersistentVolume", "PersistentVolumeClaim", "ServiceAccount":
-		return ""
-	case "Deployment", "DaemonSet", "StatefulSet", "ReplicaSet":
-		return "apps"
-	case "Job", "CronJob":
-		return "batch"
-	case "HorizontalPodAutoscaler":
-		return "autoscaling"
-	case "Ingress", "NetworkPolicy":
-		return "networking.k8s.io"
-	case "PodDisruptionBudget":
-		return "policy"
-	}
-	return ""
-}
 
 // ApplySettings filters audit results based on ignored namespaces (with wildcard
 // patterns like *-system) and disabled checks. This is the shared implementation

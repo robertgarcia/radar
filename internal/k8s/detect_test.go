@@ -1,6 +1,7 @@
 package k8s
 
 import (
+	"strings"
 	"testing"
 	"time"
 
@@ -8,6 +9,7 @@ import (
 	autoscalingv2 "k8s.io/api/autoscaling/v2"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
+	policyv1 "k8s.io/api/policy/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/client-go/kubernetes/fake"
@@ -137,7 +139,7 @@ func TestDetectProblems_PopulatesGroup(t *testing.T) {
 	}
 }
 
-func hasAllProblemTypes(problems []Problem) bool {
+func hasAllProblemTypes(problems []Detection) bool {
 	seen := map[string]bool{}
 	for _, p := range problems {
 		seen[p.Kind] = true
@@ -240,7 +242,7 @@ func TestDetectProblems_OperationalSignals(t *testing.T) {
 	}
 
 	deadline := time.Now().Add(2 * time.Second)
-	var problems []Problem
+	var problems []Detection
 	for time.Now().Before(deadline) {
 		problems = DetectProblems(cache, "prod")
 		if hasProblem(problems, "Pod", "crashy", "CrashLoopBackOff") &&
@@ -266,7 +268,7 @@ func TestDetectProblems_OperationalSignals(t *testing.T) {
 	assertProblem(t, problems, "Job", "migrate", "BackoffLimitExceeded", "critical")
 }
 
-func hasProblem(problems []Problem, kind, name, reason string) bool {
+func hasProblem(problems []Detection, kind, name, reason string) bool {
 	for _, p := range problems {
 		if p.Kind == kind && p.Name == name && p.Reason == reason {
 			return true
@@ -275,7 +277,7 @@ func hasProblem(problems []Problem, kind, name, reason string) bool {
 	return false
 }
 
-func assertProblem(t *testing.T, problems []Problem, kind, name, reason, severity string) {
+func assertProblem(t *testing.T, problems []Detection, kind, name, reason, severity string) {
 	t.Helper()
 	for _, p := range problems {
 		if p.Kind != kind || p.Name != name || p.Reason != reason {
@@ -287,4 +289,227 @@ func assertProblem(t *testing.T, problems []Problem, kind, name, reason, severit
 		return
 	}
 	t.Fatalf("missing problem kind=%s name=%s reason=%q; got %+v", kind, name, reason, problems)
+}
+
+func lookupProblem(problems []Detection, kind, name, reason string) (Detection, bool) {
+	for _, p := range problems {
+		if p.Kind == kind && p.Name == name && p.Reason == reason {
+			return p, true
+		}
+	}
+	return Detection{}, false
+}
+
+func TestDetectProblems_PDBBlocksEvictions(t *testing.T) {
+	defer ResetTestState()
+
+	now := time.Now()
+	old := metav1.NewTime(now.Add(-10 * time.Minute))
+	one := intstr.FromInt32(1)
+	half := intstr.FromString("50%")
+
+	mkPDB := func(name string, minAvailable intstr.IntOrString, allowed, current, desired, expected int32) *policyv1.PodDisruptionBudget {
+		return &policyv1.PodDisruptionBudget{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "prod", CreationTimestamp: old, Generation: 1},
+			Spec: policyv1.PodDisruptionBudgetSpec{
+				MinAvailable: &minAvailable,
+				Selector:     &metav1.LabelSelector{MatchLabels: map[string]string{"app": name}},
+			},
+			Status: policyv1.PodDisruptionBudgetStatus{
+				ObservedGeneration: 1,
+				DisruptionsAllowed: allowed,
+				CurrentHealthy:     current,
+				DesiredHealthy:     desired,
+				ExpectedPods:       expected,
+				Conditions: []metav1.Condition{{
+					Type:               policyv1.DisruptionAllowedCondition,
+					Status:             metav1.ConditionFalse,
+					Reason:             policyv1.InsufficientPodsReason,
+					LastTransitionTime: old,
+				}},
+			},
+		}
+	}
+
+	client := fake.NewClientset(
+		mkPDB("blocked", one, 0, 1, 1, 1),                // all selected pods healthy, but no eviction budget
+		mkPDB("temporarily-unhealthy", half, 0, 1, 1, 2), // no budget because a pod is unhealthy
+		mkPDB("has-budget", half, 1, 3, 2, 3),            // healthy and at least one eviction allowed
+		mkPDB("empty", one, 0, 0, 0, 0),                  // selector currently matches no pods
+	)
+	if err := InitTestResourceCache(client); err != nil {
+		t.Fatalf("InitTestResourceCache: %v", err)
+	}
+	cache := GetResourceCache()
+
+	const reason = "Voluntary evictions blocked"
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if hasProblem(DetectProblems(cache, "prod"), "PodDisruptionBudget", "blocked", reason) {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	problems := DetectProblems(cache, "prod")
+
+	p, ok := lookupProblem(problems, "PodDisruptionBudget", "blocked", reason)
+	if !ok {
+		t.Fatalf("missing blocked PDB problem; got %+v", problems)
+	}
+	if p.Severity != "high" || p.Group != "policy" {
+		t.Fatalf("blocked PDB severity/group = %q/%q, want high/policy; problem=%+v", p.Severity, p.Group, p)
+	}
+	if !strings.Contains(p.Message, "node drains and upgrades cannot evict") {
+		t.Fatalf("blocked PDB message should explain drain/upgrade impact; got %q", p.Message)
+	}
+	for _, name := range []string{"temporarily-unhealthy", "has-budget", "empty"} {
+		if hasProblem(problems, "PodDisruptionBudget", name, reason) {
+			t.Errorf("PDB %s should not be flagged as structurally blocking evictions: %+v", name, problems)
+		}
+	}
+}
+
+// TestDetectProblems_SharedRWOVolume pins the multi-replica ReadWriteOnce
+// conflict detector: a Deployment wanting >1 replica that mounts an RWO PVC is
+// flagged (only one node can attach it), while a single-replica RWO mount and a
+// multi-replica ReadWriteMany mount are not.
+func TestDetectProblems_SharedRWOVolume(t *testing.T) {
+	defer ResetTestState()
+
+	two := int32(2)
+	one := int32(1)
+	three := int32(3)
+
+	mkDeploy := func(name string, replicas *int32, claim string) *appsv1.Deployment {
+		return &appsv1.Deployment{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "prod"},
+			Spec: appsv1.DeploymentSpec{
+				Replicas: replicas,
+				Template: corev1.PodTemplateSpec{Spec: corev1.PodSpec{
+					Containers: []corev1.Container{{
+						Name:         "app",
+						VolumeMounts: []corev1.VolumeMount{{Name: "data", MountPath: "/data"}},
+					}},
+					Volumes: []corev1.Volume{{
+						Name:         "data",
+						VolumeSource: corev1.VolumeSource{PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: claim}},
+					}},
+				}},
+			},
+		}
+	}
+	mkPVC := func(name string, mode corev1.PersistentVolumeAccessMode) *corev1.PersistentVolumeClaim {
+		return &corev1.PersistentVolumeClaim{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "prod"},
+			Spec:       corev1.PersistentVolumeClaimSpec{AccessModes: []corev1.PersistentVolumeAccessMode{mode}},
+			Status:     corev1.PersistentVolumeClaimStatus{Phase: corev1.ClaimBound, AccessModes: []corev1.PersistentVolumeAccessMode{mode}},
+		}
+	}
+
+	client := fake.NewClientset(
+		mkDeploy("conflict", &two, "rwo-pvc"), // 2 replicas + RWO → flagged
+		mkDeploy("single", &one, "rwo-pvc"),   // 1 replica + RWO → fine
+		mkDeploy("rwx", &three, "rwx-pvc"),    // 3 replicas + RWX → fine
+		mkPVC("rwo-pvc", corev1.ReadWriteOnce),
+		mkPVC("rwx-pvc", corev1.ReadWriteMany),
+	)
+	if err := InitTestResourceCache(client); err != nil {
+		t.Fatalf("InitTestResourceCache: %v", err)
+	}
+	cache := GetResourceCache()
+
+	const reason = "ReadWriteOnce volume shared across replicas"
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if hasProblem(DetectProblems(cache, "prod"), "Deployment", "conflict", reason) {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	problems := DetectProblems(cache, "prod")
+
+	assertProblem(t, problems, "Deployment", "conflict", reason, "high")
+	if hasProblem(problems, "Deployment", "single", reason) {
+		t.Errorf("single-replica RWO mount should not be flagged: %+v", problems)
+	}
+	if hasProblem(problems, "Deployment", "rwx", reason) {
+		t.Errorf("multi-replica RWX mount should not be flagged: %+v", problems)
+	}
+}
+
+func TestDetectProblems_RolloutStuckExplainsRWORollingUpdate(t *testing.T) {
+	defer ResetTestState()
+
+	now := time.Now()
+	old := metav1.NewTime(now.Add(-20 * time.Minute))
+	transition := metav1.NewTime(now.Add(-5 * time.Minute))
+	one := int32(1)
+
+	mkDeploy := func(name string, strategy appsv1.DeploymentStrategyType) *appsv1.Deployment {
+		return &appsv1.Deployment{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "prod", CreationTimestamp: old},
+			Spec: appsv1.DeploymentSpec{
+				Replicas: &one,
+				Strategy: appsv1.DeploymentStrategy{Type: strategy},
+				Template: corev1.PodTemplateSpec{Spec: corev1.PodSpec{
+					Containers: []corev1.Container{{
+						Name:         "app",
+						VolumeMounts: []corev1.VolumeMount{{Name: "data", MountPath: "/data"}},
+					}},
+					Volumes: []corev1.Volume{{
+						Name:         "data",
+						VolumeSource: corev1.VolumeSource{PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: "data"}},
+					}},
+				}},
+			},
+			Status: appsv1.DeploymentStatus{
+				Conditions: []appsv1.DeploymentCondition{{
+					Type:               appsv1.DeploymentProgressing,
+					Status:             corev1.ConditionFalse,
+					Reason:             "ProgressDeadlineExceeded",
+					Message:            "ReplicaSet has timed out progressing.",
+					LastTransitionTime: transition,
+				}},
+			},
+		}
+	}
+	client := fake.NewClientset(
+		mkDeploy("rolling", appsv1.RollingUpdateDeploymentStrategyType),
+		mkDeploy("recreate", appsv1.RecreateDeploymentStrategyType),
+		&corev1.PersistentVolumeClaim{
+			ObjectMeta: metav1.ObjectMeta{Name: "data", Namespace: "prod"},
+			Spec:       corev1.PersistentVolumeClaimSpec{AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}},
+			Status:     corev1.PersistentVolumeClaimStatus{Phase: corev1.ClaimBound, AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}},
+		},
+	)
+	if err := InitTestResourceCache(client); err != nil {
+		t.Fatalf("InitTestResourceCache: %v", err)
+	}
+	cache := GetResourceCache()
+
+	const reason = "Rollout stuck"
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if hasProblem(DetectProblems(cache, "prod"), "Deployment", "rolling", reason) &&
+			hasProblem(DetectProblems(cache, "prod"), "Deployment", "recreate", reason) {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	problems := DetectProblems(cache, "prod")
+
+	rolling, ok := lookupProblem(problems, "Deployment", "rolling", reason)
+	if !ok {
+		t.Fatalf("missing rolling rollout problem; got %+v", problems)
+	}
+	if !strings.Contains(rolling.Message, "strategy: Recreate") || !strings.Contains(rolling.Message, `ReadWriteOnce PVC "data"`) {
+		t.Fatalf("rolling rollout message should include RWO/RollingUpdate fix; got %q", rolling.Message)
+	}
+	recreate, ok := lookupProblem(problems, "Deployment", "recreate", reason)
+	if !ok {
+		t.Fatalf("missing recreate rollout problem; got %+v", problems)
+	}
+	if strings.Contains(recreate.Message, "strategy: Recreate") {
+		t.Fatalf("recreate rollout should not get RWO/RollingUpdate hint; got %q", recreate.Message)
+	}
 }

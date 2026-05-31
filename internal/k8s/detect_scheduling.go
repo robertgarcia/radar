@@ -10,6 +10,7 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/labels"
 )
 
@@ -433,11 +434,11 @@ func sortedKeys(m map[string]string) []string {
 // (arch/zone/taint/resources) instead of just "Pending". namespace="" scans
 // all namespaces. Post-bind (ContainerCreating/CNI/volume) and admission
 // (quota with no Pod) failures are handled by separate detectors.
-func DetectSchedulingProblems(cache *ResourceCache, namespace string) []Problem {
+func DetectSchedulingProblems(cache *ResourceCache, namespace string) []Detection {
 	if cache == nil {
 		return nil
 	}
-	var problems []Problem
+	var problems []Detection
 	now := time.Now()
 	nodes := schedulingNodeFacts(cache)
 
@@ -461,7 +462,8 @@ func DetectSchedulingProblems(cache *ResourceCache, namespace string) []Problem 
 			if !cond.LastTransitionTime.IsZero() {
 				dur = now.Sub(cond.LastTransitionTime.Time)
 			}
-			problems = append(problems, Problem{
+			ownerGroup, ownerKind, ownerName := podOwnerKindName(cache, pod)
+			problems = append(problems, Detection{
 				Kind:            "Pod",
 				Namespace:       pod.Namespace,
 				Name:            pod.Name,
@@ -472,6 +474,9 @@ func DetectSchedulingProblems(cache *ResourceCache, namespace string) []Problem 
 				AgeSeconds:      int64(ageDur.Seconds()),
 				Duration:        FormatAge(dur),
 				DurationSeconds: int64(dur.Seconds()),
+				OwnerGroup:      ownerGroup,
+				OwnerKind:       ownerKind,
+				OwnerName:       ownerName,
 			})
 		}
 	}
@@ -549,9 +554,21 @@ func describeUnschedulable(pod *corev1.Pod, schedMsg string, nodes []NodeFacts) 
 // summarizeReasons renders the parsed predicate counts into a compact phrase.
 // When skipAffinity is set, the generic node-affinity/selector clause is
 // omitted because describeUnschedulable already emitted the resolved label.
+//
+// Clauses are ordered by how many nodes each rejected, descending — the
+// scheduler emits them in an arbitrary predicate order, so leading with the
+// widest-blast-radius constraint surfaces the dominant reason first ("2 node(s)
+// node affinity/selector mismatch" before "1 node(s) pod anti-affinity
+// conflict") instead of whichever predicate the scheduler happened to list
+// first. Stable, so equal counts keep the scheduler's order; count-0
+// whole-message clauses (e.g. unbound PVC) sink to the end.
 func summarizeReasons(reasons []SchedulingReason, skipAffinity bool) string {
+	ordered := make([]SchedulingReason, len(reasons))
+	copy(ordered, reasons)
+	sort.SliceStable(ordered, func(i, j int) bool { return ordered[i].NodeCount > ordered[j].NodeCount })
+
 	var parts []string
-	for _, r := range reasons {
+	for _, r := range ordered {
 		switch r.Class {
 		case SchedInsufficientResource:
 			res := r.Resource
@@ -661,14 +678,14 @@ const admissionFailureWindow = 30 * time.Minute
 
 // DetectAdmissionProblems flags pod-template rejections at admission time.
 // namespace="" scans all namespaces.
-func DetectAdmissionProblems(cache *ResourceCache, namespace string) []Problem {
+func DetectAdmissionProblems(cache *ResourceCache, namespace string) []Detection {
 	if cache == nil {
 		return nil
 	}
 	return detectAdmissionFailures(cache, namespace)
 }
 
-func detectAdmissionFailures(cache *ResourceCache, namespace string) []Problem {
+func detectAdmissionFailures(cache *ResourceCache, namespace string) []Detection {
 	if cache.Events() == nil {
 		return nil
 	}
@@ -721,12 +738,12 @@ func detectAdmissionFailures(cache *ResourceCache, namespace string) []Problem {
 		order = append(order, key)
 	}
 
-	problems := make([]Problem, 0, len(order))
+	problems := make([]Detection, 0, len(order))
 	for _, key := range order {
 		c := latest[key]
 		obj := c.ev.InvolvedObject
 		ageDur := now.Sub(eventFirstTime(c.ev))
-		problems = append(problems, Problem{
+		problems = append(problems, Detection{
 			Kind:            obj.Kind,
 			Namespace:       obj.Namespace,
 			Name:            obj.Name,
@@ -762,7 +779,7 @@ func eventFirstTime(e *corev1.Event) time.Time {
 // admissionTargetStillBlocked reports whether the controller named by a
 // FailedCreate event still has unmet replicas, i.e. the rejection is active.
 // A recovered workload has its replicas, so its lingering event is skipped.
-// Unknown kinds / not-found default to true — never drop genuine coverage.
+// Unknown kinds / unreadable listers default to true — never drop genuine coverage.
 func admissionTargetStillBlocked(cache *ResourceCache, obj corev1.ObjectReference) bool {
 	// "Blocked" means the controller still can't CREATE its pods — measured by
 	// created-count (Status.Replicas / CurrentNumberScheduled) below desired,
@@ -772,37 +789,57 @@ func admissionTargetStillBlocked(cache *ResourceCache, obj corev1.ObjectReferenc
 	switch obj.Kind {
 	case "ReplicaSet":
 		if l := cache.ReplicaSets(); l != nil {
-			if rs, err := l.ReplicaSets(obj.Namespace).Get(obj.Name); err == nil {
+			rs, err := l.ReplicaSets(obj.Namespace).Get(obj.Name)
+			if err == nil {
 				return rs.Status.Replicas < schedDesiredReplicas(rs.Spec.Replicas)
+			}
+			if apierrors.IsNotFound(err) {
+				return false
 			}
 		}
 	case "Deployment":
 		if l := cache.Deployments(); l != nil {
-			if d, err := l.Deployments(obj.Namespace).Get(obj.Name); err == nil {
+			d, err := l.Deployments(obj.Namespace).Get(obj.Name)
+			if err == nil {
 				return d.Status.Replicas < schedDesiredReplicas(d.Spec.Replicas)
+			}
+			if apierrors.IsNotFound(err) {
+				return false
 			}
 		}
 	case "StatefulSet":
 		if l := cache.StatefulSets(); l != nil {
-			if ss, err := l.StatefulSets(obj.Namespace).Get(obj.Name); err == nil {
+			ss, err := l.StatefulSets(obj.Namespace).Get(obj.Name)
+			if err == nil {
 				return ss.Status.Replicas < schedDesiredReplicas(ss.Spec.Replicas)
+			}
+			if apierrors.IsNotFound(err) {
+				return false
 			}
 		}
 	case "DaemonSet":
 		if l := cache.DaemonSets(); l != nil {
-			if ds, err := l.DaemonSets(obj.Namespace).Get(obj.Name); err == nil {
+			ds, err := l.DaemonSets(obj.Namespace).Get(obj.Name)
+			if err == nil {
 				return ds.Status.CurrentNumberScheduled < ds.Status.DesiredNumberScheduled
+			}
+			if apierrors.IsNotFound(err) {
+				return false
 			}
 		}
 	case "Job":
 		if l := cache.Jobs(); l != nil {
-			if j, err := l.Jobs(obj.Namespace).Get(obj.Name); err == nil {
+			j, err := l.Jobs(obj.Namespace).Get(obj.Name)
+			if err == nil {
 				// Only "blocked" if the Job has created NO pod yet — any of
 				// Active/Succeeded/Failed > 0 means a pod was created (so the
 				// rejection isn't admission-from-the-start), and a stale quota
 				// event shouldn't surface for it. (Trade-off: a Job that ran
 				// some pods, then gets quota-blocked mid-retry, is not flagged.)
 				return j.Status.Active == 0 && j.Status.Succeeded == 0 && j.Status.Failed == 0
+			}
+			if apierrors.IsNotFound(err) {
+				return false
 			}
 		}
 	}
@@ -858,7 +895,7 @@ var postBindSeverity = map[string]string{
 
 // DetectPostBindProblems flags pods stuck in ContainerCreating due to CNI/IP
 // or volume failures. namespace="" scans all namespaces.
-func DetectPostBindProblems(cache *ResourceCache, namespace string) []Problem {
+func DetectPostBindProblems(cache *ResourceCache, namespace string) []Detection {
 	if cache == nil || cache.Events() == nil {
 		return nil
 	}
@@ -911,7 +948,7 @@ func DetectPostBindProblems(cache *ResourceCache, namespace string) []Problem {
 		order = append(order, key)
 	}
 
-	problems := make([]Problem, 0, len(order))
+	problems := make([]Detection, 0, len(order))
 	for _, key := range order {
 		c := latest[key]
 		pod := stuck[key]
@@ -920,7 +957,8 @@ func DetectPostBindProblems(cache *ResourceCache, namespace string) []Problem {
 			severity = "high"
 		}
 		ageDur := now.Sub(pod.CreationTimestamp.Time)
-		problems = append(problems, Problem{
+		ownerGroup, ownerKind, ownerName := podOwnerKindName(cache, pod)
+		problems = append(problems, Detection{
 			Kind:            "Pod",
 			Namespace:       pod.Namespace,
 			Name:            pod.Name,
@@ -931,6 +969,9 @@ func DetectPostBindProblems(cache *ResourceCache, namespace string) []Problem {
 			AgeSeconds:      int64(ageDur.Seconds()),
 			Duration:        FormatAge(ageDur),
 			DurationSeconds: int64(ageDur.Seconds()),
+			OwnerGroup:      ownerGroup,
+			OwnerKind:       ownerKind,
+			OwnerName:       ownerName,
 		})
 	}
 	return problems

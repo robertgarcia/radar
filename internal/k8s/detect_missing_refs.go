@@ -2,7 +2,9 @@ package k8s
 
 import (
 	"fmt"
+	"hash/fnv"
 	"log"
+	"strings"
 	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -51,13 +53,13 @@ import (
 // namespace="" scans all namespaces for namespaced sources. Cluster-scoped
 // sources (ClusterRoleBinding) are only scanned when namespace="" — passing
 // a namespace narrows the result set, matching DetectProblems' semantics.
-func DetectMissingRefs(cache *ResourceCache, namespace string) []Problem {
+func DetectMissingRefs(cache *ResourceCache, namespace string) []Detection {
 	if cache == nil {
 		return nil
 	}
 	now := time.Now()
 
-	var problems []Problem
+	var problems []Detection
 	problems = append(problems, detectPodMissingRefs(cache, namespace, now)...)
 	problems = append(problems, detectStatefulSetMissingService(cache, namespace, now)...)
 	problems = append(problems, detectHPAMissingTarget(cache, namespace, now)...)
@@ -68,26 +70,53 @@ func DetectMissingRefs(cache *ResourceCache, namespace string) []Problem {
 }
 
 // missingRefProblem builds a critical-severity Problem rooted at the resource
-// holding the dangling reference. Age and Duration both fall back to the
-// source resource's age — there's no separate "ref broke at" event we can
-// anchor to, and any other duration would be a heuristic.
-func missingRefProblem(kind, group, ns, name, reason, message string, age time.Duration) Problem {
-	return Problem{
+// holding the dangling reference. Most dangling refs break a running thing now
+// (a Pod can't mount a missing Secret, an Ingress route returns nothing), so
+// critical is the default. Use missingRefProblemSev for the inert/latent
+// classes (single-replica headless Service, deprecated-RBAC residue) that don't
+// warrant a critical.
+func missingRefProblem(kind, group, ns, name, reason, message string, age time.Duration) Detection {
+	return missingRefProblemSev(kind, group, ns, name, "critical", reason, message, age)
+}
+
+// missingRefProblemSev is missingRefProblem with an explicit severity. Severity
+// follows "does the gap break a running thing now?": critical (breaks now),
+// warning (latent — will break when used), info (inert/cosmetic residue). Age
+// and Duration fall back to the source resource's age — there's no separate
+// "ref broke at" event to anchor to.
+func missingRefProblemSev(kind, group, ns, name, severity, reason, message string, age time.Duration) Detection {
+	return Detection{
 		Kind:            kind,
 		Group:           group,
 		Namespace:       ns,
 		Name:            name,
-		Severity:        "critical",
+		Severity:        severity,
 		Reason:          reason,
 		Message:         message,
 		Age:             FormatAge(age),
 		AgeSeconds:      int64(age.Seconds()),
 		Duration:        FormatAge(age),
 		DurationSeconds: int64(age.Seconds()),
+		Fingerprint:     missingRefFingerprint(reason, message),
 	}
 }
 
-func detectPodMissingRefs(cache *ResourceCache, namespace string, now time.Time) []Problem {
+func missingRefFingerprint(reason, detail string) string {
+	// Keep same-category causes distinct without raw ref names in the issue ID input.
+	h := fnv.New64a()
+	_, _ = h.Write([]byte(detail))
+	return fmt.Sprintf("%s|%016x", reason, h.Sum64())
+}
+
+// isTerminalPod reports whether a pod has terminally finished — Succeeded, or
+// Failed without a pending restart. Such pods are not live workloads whose
+// configuration you'd fix to make them start, so they're excluded from
+// missing-ref detection.
+func isTerminalPod(p *corev1.Pod) bool {
+	return p.Status.Phase == corev1.PodSucceeded || p.Status.Phase == corev1.PodFailed
+}
+
+func detectPodMissingRefs(cache *ResourceCache, namespace string, now time.Time) []Detection {
 	podLister := cache.Pods()
 	if podLister == nil {
 		return nil
@@ -104,13 +133,30 @@ func detectPodMissingRefs(cache *ResourceCache, namespace string, now time.Time)
 	pvcLister := cache.PersistentVolumeClaims()
 	saLister := cache.ServiceAccounts()
 
-	var out []Problem
+	var out []Detection
 	for _, p := range pods {
+		// Terminal pods aren't a config error to fix: a Succeeded pod (or a
+		// Failed one a Job won't retry) already ran to its end. Its referenced
+		// ServiceAccount/ConfigMap/Secret may have been GC'd afterward, so
+		// flagging the dangling ref as a live critical issue is the classic
+		// completed-Job-pod false positive. Genuine failures still surface —
+		// a Failed pod is reported via ClassifyPodHealth (SourceProblem) and a
+		// failing Job via failedJobCondition.
+		if isTerminalPod(p) {
+			continue
+		}
 		age := now.Sub(p.CreationTimestamp.Time)
 		seen := map[string]bool{}
 
+		// Carry the resolved workload owner so missing-ref pod issues fold under
+		// their controller — 50 pods missing the same ConfigMap is ONE workload
+		// issue, not 50 pod rows. Mirrors the owner resolution on the
+		// DetectProblems / scheduling pod paths.
+		ownerGroup, ownerKind, ownerName := podOwnerKindName(cache, p)
 		emit := func(reason, message string) {
-			out = append(out, missingRefProblem("Pod", "", p.Namespace, p.Name, reason, message, age))
+			pr := missingRefProblem("Pod", "", p.Namespace, p.Name, reason, message, age)
+			pr.OwnerGroup, pr.OwnerKind, pr.OwnerName = ownerGroup, ownerKind, ownerName
+			out = append(out, pr)
 		}
 
 		// Volumes: persistentVolumeClaim, configMap, secret
@@ -273,7 +319,7 @@ func detectPodMissingRefs(cache *ResourceCache, namespace string, now time.Time)
 	return out
 }
 
-func detectHPAMissingTarget(cache *ResourceCache, namespace string, now time.Time) []Problem {
+func detectHPAMissingTarget(cache *ResourceCache, namespace string, now time.Time) []Detection {
 	hpaLister := cache.HorizontalPodAutoscalers()
 	if hpaLister == nil {
 		return nil
@@ -285,7 +331,7 @@ func detectHPAMissingTarget(cache *ResourceCache, namespace string, now time.Tim
 		hpas, _ = hpaLister.List(labels.Everything())
 	}
 
-	var out []Problem
+	var out []Detection
 	for _, h := range hpas {
 		ref := h.Spec.ScaleTargetRef
 		if ref.Name == "" {
@@ -336,7 +382,7 @@ func workloadExists(cache *ResourceCache, kind, namespace, name string) (verifia
 	return false, false
 }
 
-func detectIngressMissingBackend(cache *ResourceCache, namespace string, now time.Time) []Problem {
+func detectIngressMissingBackend(cache *ResourceCache, namespace string, now time.Time) []Detection {
 	ingLister := cache.Ingresses()
 	if ingLister == nil {
 		return nil
@@ -354,7 +400,7 @@ func detectIngressMissingBackend(cache *ResourceCache, namespace string, now tim
 		ings, _ = ingLister.List(labels.Everything())
 	}
 
-	var out []Problem
+	var out []Detection
 	for _, ing := range ings {
 		age := now.Sub(ing.CreationTimestamp.Time)
 		seenSvc := map[string]bool{}
@@ -447,7 +493,7 @@ func detectIngressMissingBackend(cache *ResourceCache, namespace string, now tim
 	return out
 }
 
-func detectStatefulSetMissingService(cache *ResourceCache, namespace string, now time.Time) []Problem {
+func detectStatefulSetMissingService(cache *ResourceCache, namespace string, now time.Time) []Detection {
 	stsLister := cache.StatefulSets()
 	if stsLister == nil {
 		return nil
@@ -463,7 +509,7 @@ func detectStatefulSetMissingService(cache *ResourceCache, namespace string, now
 		stss, _ = stsLister.List(labels.Everything())
 	}
 
-	var out []Problem
+	var out []Detection
 	for _, sts := range stss {
 		// spec.serviceName names the headless Service that creates per-pod
 		// DNS records. It's required by the StatefulSet API, so an empty
@@ -474,10 +520,23 @@ func detectStatefulSetMissingService(cache *ResourceCache, namespace string, now
 		}
 		if _, err := svcLister.Services(sts.Namespace).Get(sts.Spec.ServiceName); err != nil {
 			age := now.Sub(sts.CreationTimestamp.Time)
-			out = append(out, missingRefProblem("StatefulSet", "apps", sts.Namespace, sts.Name,
-				"Missing headless Service",
-				fmt.Sprintf("spec.serviceName references Service %q which does not exist (pods will schedule but per-pod DNS records won't be created; peer discovery silently broken)", sts.Spec.ServiceName),
-				age))
+			// The headless Service only matters for multi-replica peer DNS. For
+			// a single-replica StatefulSet (a controller running as a singleton)
+			// there are no peers to discover, so the missing Service is inert —
+			// info, not critical. Multi-replica is a real (if not urgent)
+			// degradation → warning.
+			replicas := int32(1)
+			if sts.Spec.Replicas != nil {
+				replicas = *sts.Spec.Replicas
+			}
+			severity := "info"
+			message := fmt.Sprintf("spec.serviceName references Service %q which does not exist; single-replica StatefulSet has no peers, so per-pod DNS is inert", sts.Spec.ServiceName)
+			if replicas > 1 {
+				severity = "warning"
+				message = fmt.Sprintf("spec.serviceName references Service %q which does not exist (pods will schedule but per-pod DNS records won't be created; peer discovery silently broken)", sts.Spec.ServiceName)
+			}
+			out = append(out, missingRefProblemSev("StatefulSet", "apps", sts.Namespace, sts.Name,
+				severity, "Missing headless Service", message, age))
 		}
 	}
 	return out
@@ -498,7 +557,7 @@ func detectStatefulSetMissingService(cache *ResourceCache, namespace string, now
 // pkg/k8score/transform.go to avoid retaining heavy schema/caBundle data,
 // so reading those refs from the cache is impossible. Would need a direct
 // API list bypassing the transform — tracked as a follow-up.
-func DetectMissingWebhookRefs(cache *ResourceCache, dynamicCache *DynamicResourceCache, discovery *ResourceDiscovery, namespace string) []Problem {
+func DetectMissingWebhookRefs(cache *ResourceCache, dynamicCache *DynamicResourceCache, discovery *ResourceDiscovery, namespace string) []Detection {
 	if cache == nil || dynamicCache == nil || discovery == nil {
 		return nil
 	}
@@ -526,7 +585,7 @@ func DetectMissingWebhookRefs(cache *ResourceCache, dynamicCache *DynamicResourc
 		return items
 	}
 
-	emit := func(kind, group, name, source, svcNS, svcName string, age time.Duration) Problem {
+	emit := func(kind, group, name, source, svcNS, svcName string, age time.Duration) Detection {
 		return missingRefProblem(kind, group, "", name,
 			"Missing webhook backend Service",
 			fmt.Sprintf("%s references Service %q in namespace %q which does not exist (webhook will not be invoked; admission rules silently bypassed when failurePolicy=Ignore, or admission halted when failurePolicy=Fail)",
@@ -534,8 +593,8 @@ func DetectMissingWebhookRefs(cache *ResourceCache, dynamicCache *DynamicResourc
 			age)
 	}
 
-	checkWebhookList := func(items []*unstructured.Unstructured, ownerKind, ownerGroup, webhookPath string) []Problem {
-		var problems []Problem
+	checkWebhookList := func(items []*unstructured.Unstructured, ownerKind, ownerGroup, webhookPath string) []Detection {
+		var problems []Detection
 		for _, item := range items {
 			webhooks, found, err := unstructured.NestedSlice(item.Object, webhookPath)
 			if err != nil || !found {
@@ -572,7 +631,7 @@ func DetectMissingWebhookRefs(cache *ResourceCache, dynamicCache *DynamicResourc
 		return problems
 	}
 
-	var out []Problem
+	var out []Detection
 	out = append(out, checkWebhookList(
 		listByKind("ValidatingWebhookConfiguration", "admissionregistration.k8s.io"),
 		"ValidatingWebhookConfiguration", "admissionregistration.k8s.io", "webhooks",
@@ -584,7 +643,7 @@ func DetectMissingWebhookRefs(cache *ResourceCache, dynamicCache *DynamicResourc
 	return out
 }
 
-func detectPVCMissingStorageClass(cache *ResourceCache, namespace string, now time.Time) []Problem {
+func detectPVCMissingStorageClass(cache *ResourceCache, namespace string, now time.Time) []Detection {
 	pvcLister := cache.PersistentVolumeClaims()
 	if pvcLister == nil {
 		return nil
@@ -601,7 +660,7 @@ func detectPVCMissingStorageClass(cache *ResourceCache, namespace string, now ti
 		pvcs, _ = pvcLister.List(labels.Everything())
 	}
 
-	var out []Problem
+	var out []Detection
 	for _, pvc := range pvcs {
 		// nil or empty storageClassName defers to the cluster default — that's
 		// not a ref error. Only flag when a concrete name is set + missing.
@@ -620,7 +679,19 @@ func detectPVCMissingStorageClass(cache *ResourceCache, namespace string, now ti
 	return out
 }
 
-func detectRoleBindingMissingRole(cache *ResourceCache, namespace string, now time.Time) []Problem {
+// danglingRoleBindingSeverity rates a binding whose roleRef target is missing.
+// A dangling binding grants no permissions, so it's never critical — at most a
+// latent footgun (warning). Deprecated-PodSecurityPolicy residue (GKE's
+// gce:podsecuritypolicy:* bindings, left behind after PSP was removed in k8s
+// 1.25) is inert managed cruft present on every GKE cluster → info.
+func danglingRoleBindingSeverity(bindingName, roleRefName string) string {
+	if strings.HasPrefix(bindingName, "gce:podsecuritypolicy:") || strings.HasPrefix(roleRefName, "gce:podsecuritypolicy:") {
+		return "info"
+	}
+	return "warning"
+}
+
+func detectRoleBindingMissingRole(cache *ResourceCache, namespace string, now time.Time) []Detection {
 	roleLister := cache.Roles()
 	crLister := cache.ClusterRoles()
 	rbLister := cache.RoleBindings()
@@ -644,7 +715,7 @@ func detectRoleBindingMissingRole(cache *ResourceCache, namespace string, now ti
 		return false, false
 	}
 
-	var out []Problem
+	var out []Detection
 
 	if rbLister != nil {
 		var rbs []*rbacv1.RoleBinding
@@ -659,8 +730,8 @@ func detectRoleBindingMissingRole(cache *ResourceCache, namespace string, now ti
 				continue
 			}
 			age := now.Sub(rb.CreationTimestamp.Time)
-			out = append(out, missingRefProblem("RoleBinding", "rbac.authorization.k8s.io", rb.Namespace, rb.Name,
-				"Missing roleRef target",
+			out = append(out, missingRefProblemSev("RoleBinding", "rbac.authorization.k8s.io", rb.Namespace, rb.Name,
+				danglingRoleBindingSeverity(rb.Name, rb.RoleRef.Name), "Missing roleRef target",
 				fmt.Sprintf("roleRef points at %s %q which does not exist (binding grants no permissions)", rb.RoleRef.Kind, rb.RoleRef.Name),
 				age))
 		}
@@ -677,8 +748,8 @@ func detectRoleBindingMissingRole(cache *ResourceCache, namespace string, now ti
 				continue
 			}
 			age := now.Sub(crb.CreationTimestamp.Time)
-			out = append(out, missingRefProblem("ClusterRoleBinding", "rbac.authorization.k8s.io", "", crb.Name,
-				"Missing roleRef target",
+			out = append(out, missingRefProblemSev("ClusterRoleBinding", "rbac.authorization.k8s.io", "", crb.Name,
+				danglingRoleBindingSeverity(crb.Name, crb.RoleRef.Name), "Missing roleRef target",
 				fmt.Sprintf("roleRef points at %s %q which does not exist (binding grants no permissions)", crb.RoleRef.Kind, crb.RoleRef.Name),
 				age))
 		}

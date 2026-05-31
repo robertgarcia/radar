@@ -11,12 +11,13 @@
 //
 // Two compile entry points:
 //
-//   CompileObjectFilter — bindings shaped to a K8s object:
-//     kind, apiVersion, metadata, spec, status, labels, annotations
+//	CompileObjectFilter — bindings shaped to a K8s object:
+//	  kind, apiVersion, metadata, spec, status, labels, annotations
 //
-//   CompileIssueFilter — bindings shaped to an issues.Issue:
-//     severity, source, kind, group, namespace, name, reason, message,
-//     count, last_seen, cluster
+//	CompileIssueFilter — bindings shaped to an issues.Issue:
+//	  severity, source, category, category_group, kind, group, ns,
+//	  name, reason, message, count, first_seen, last_seen, grouping_scope,
+//	  restart_count, last_terminated_reason
 //
 // Both return a Filter whose Match(activation) yields (bool, error).
 // Compile errors are returned verbatim (CEL's parser produces
@@ -96,6 +97,8 @@ var envObject = mustNewEnv(
 var envIssue = mustNewEnv(
 	cel.Variable("severity", cel.StringType),
 	cel.Variable("source", cel.StringType),
+	cel.Variable("category", cel.StringType),
+	cel.Variable("category_group", cel.StringType),
 	cel.Variable("kind", cel.StringType),
 	cel.Variable("group", cel.StringType),
 	cel.Variable("ns", cel.StringType),
@@ -103,11 +106,21 @@ var envIssue = mustNewEnv(
 	cel.Variable("reason", cel.StringType),
 	cel.Variable("message", cel.StringType),
 	cel.Variable("count", cel.IntType),
-	cel.Variable("cluster", cel.StringType),
-	// last_seen is provided as an int unix-second timestamp so the
-	// agent can write `last_seen > timestamp("2025-01-01T00:00:00Z")`
-	// or compare against a "now - 1h" delta passed by the caller.
+	// No `cluster` binding: a single Radar is one cluster. Cross-cluster scoping
+	// is the hub's `clusters=`/target mechanism (applied at fan-out), not a
+	// per-issue CEL predicate — Issue.Cluster was always empty here, so a
+	// forwarded `cluster == "x"` matched nothing.
+	// first_seen/last_seen are int unix-second timestamps so the agent can
+	// write `first_seen > timestamp("2025-01-01T00:00:00Z")` or compare
+	// against a "now - 1h" delta. Prefer first_seen for "issues older
+	// than…": last_seen churns to compose-time on every poll.
+	cel.Variable("first_seen", cel.IntType),
 	cel.Variable("last_seen", cel.IntType),
+	// grouping_scope (node|workload|…) slices node-level vs workload issues;
+	// restart_count + last_terminated_reason are the chronic-vs-acute fields.
+	cel.Variable("grouping_scope", cel.StringType),
+	cel.Variable("restart_count", cel.IntType),
+	cel.Variable("last_terminated_reason", cel.StringType),
 )
 
 func mustNewEnv(opts ...cel.EnvOption) *cel.Env {
@@ -264,4 +277,3 @@ func CachedIssueFilter(expr string) (*Filter, error) {
 	defaultCache.put(key, f)
 	return f, nil
 }
-

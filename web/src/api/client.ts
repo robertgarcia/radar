@@ -237,7 +237,7 @@ export interface DashboardCRDCount {
 }
 
 // Re-export shared types from k8s-ui — single source of truth
-import type { AuditCardData, AuditFinding, ResourceGroup, CheckMeta, Check } from '@skyhook-io/k8s-ui'
+import type { AuditCardData, AuditFinding, ResourceGroup, CheckMeta, Check, Issue } from '@skyhook-io/k8s-ui'
 export type DashboardAudit = AuditCardData
 export type { AuditFinding, ResourceGroup, CheckMeta, Check }
 
@@ -334,6 +334,34 @@ export function useAudit(namespaces: string[] = []) {
     queryFn: () => fetchJSON(`/audit${params}`),
     staleTime: 30000,
     refetchInterval: 60000,
+    placeholderData: (prev) => prev,
+  })
+}
+
+// Live cluster Issues — the grouped triage queue (radar's /api/issues =
+// internal/issues.Compose+Classify+Group). Single-cluster here; the Hub fleet
+// view fans the same shape across clusters. keepPreviousData semantics via
+// placeholderData so the queue doesn't flash empty on the 30s refresh.
+// total = rows returned (after the cap); total_matched = rows that matched
+// before the cap. total_matched > total means the queue was truncated — surface
+// that honestly rather than presenting a capped list as if it were complete.
+export interface IssuesResponse {
+  issues: Issue[]
+  total?: number
+  total_matched?: number
+  // Present only when RBAC visibility is incomplete (absent = full access).
+  // state 'degraded' means core workload reads are denied, so an empty list may
+  // mean "can't see" rather than "nothing broken" — the UI must say so.
+  visibility?: { state?: string; impact?: string }
+}
+
+export function useIssues(namespaces: string[] = []) {
+  const params = namespaces.length > 0 ? `?namespaces=${namespaces.join(',')}` : ''
+  return useQuery<IssuesResponse>({
+    queryKey: ['issues', namespaces],
+    queryFn: () => fetchJSON(`/issues${params}`),
+    staleTime: 30000,
+    refetchInterval: 30000,
     placeholderData: (prev) => prev,
   })
 }

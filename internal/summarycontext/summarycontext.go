@@ -191,10 +191,32 @@ func BuildIssueIndex(p issues.Provider, namespaces []string) IssueIndex {
 		Namespaces: namespaces,
 		Limit:      issues.NoLimit,
 	}
-	composed := issues.Compose(p, filters)
-	idx := make(IssueIndex, len(composed))
-	for _, iss := range composed {
-		idx[issueIndexKey(iss.Group, iss.Kind, iss.Namespace, iss.Name)]++
+	// Compose FLAT (uncapped): every evidence row carries the grouped issue ID
+	// (enrichIdentity keys it on owner-else-self + category) and its resolved
+	// Owner. Counting DISTINCT grouped issue IDs per resource — keyed on each
+	// evidence resource AND its owner (the grouped subject) — makes get_resource
+	// on the workload OR on ANY of its (arbitrarily many) affected pods surface
+	// the same issue. Iterating the grouped issue's inline Members instead would
+	// drop members past the maxInlineMembers cap; keying only the evidence (the
+	// old flat index) dropped the owner.
+	flat := issues.Compose(p, filters)
+	seen := make(map[string]map[string]bool, len(flat)) // resourceKey -> set of grouped issue IDs
+	mark := func(group, kind, namespace, name, id string) {
+		k := issueIndexKey(group, kind, namespace, name)
+		if seen[k] == nil {
+			seen[k] = make(map[string]bool)
+		}
+		seen[k][id] = true
+	}
+	for _, f := range flat {
+		mark(f.Group, f.Kind, f.Namespace, f.Name, f.ID)
+		if f.Owner.Kind != "" {
+			mark(f.Owner.Group, f.Owner.Kind, f.Owner.Namespace, f.Owner.Name, f.ID)
+		}
+	}
+	idx := make(IssueIndex, len(seen))
+	for k, ids := range seen {
+		idx[k] = len(ids)
 	}
 	return idx
 }

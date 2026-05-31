@@ -27,7 +27,8 @@ import (
 //	severity=  critical,warning  (default: all)
 //	kind=      Pod,Deployment,...  (default: all)
 //	filter=    optional CEL predicate over each row (bindings include source)
-//	limit=     default 200, max 1000
+//	limit=     default 200, max 1000 (counts issue groups, not member objects)
+//	view=      flat → raw pre-fold evidence rows (debug); default → grouped
 func (s *Server) handleIssues(w http.ResponseWriter, r *http.Request) {
 	if !s.requireConnected(w) {
 		return
@@ -42,10 +43,17 @@ func (s *Server) handleIssues(w http.ResponseWriter, r *http.Request) {
 
 	// Auth-filter the requested namespaces. nil = "all namespaces" (user
 	// is unrestricted); non-nil empty = "user has no access to anything
-	// they asked for" → return empty rather than leak cluster-wide rows.
+	// they asked for".
 	namespaces := s.parseNamespacesForUser(r)
 	if noNamespaceAccess(namespaces) {
-		s.writeJSON(w, map[string]any{"issues": []any{}, "total": 0})
+		// If the caller EXPLICITLY named namespace(s) they can't access, that's
+		// a denial — surface it as 403, not an empty (reads-as-"nothing broken")
+		// list. Bad trust boundary otherwise, especially for an agent.
+		if q.Get("namespace") != "" || q.Get("namespaces") != "" {
+			s.writeError(w, http.StatusForbidden, "no access to the requested namespace(s)")
+			return
+		}
+		s.writeJSON(w, map[string]any{"issues": []any{}, "total": 0, "total_matched": 0})
 		return
 	}
 
@@ -59,6 +67,10 @@ func (s *Server) handleIssues(w http.ResponseWriter, r *http.Request) {
 		Severities: severities,
 		Kinds:      splitCSV(q.Get("kind")),
 		Limit:      parseLimit(q.Get("limit")),
+		// Grouped is the product default — one row per subject+category.
+		// ?view=flat returns the raw pre-fold evidence rows for debugging
+		// ("what folded into this group?") and internal inspection.
+		Grouped: q.Get("view") != "flat",
 		CanReadClusterScoped: func(kind, group string) bool {
 			if auth.UserFromContext(r.Context()) == nil {
 				return true
@@ -80,24 +92,13 @@ func (s *Server) handleIssues(w http.ResponseWriter, r *http.Request) {
 	}
 
 	out, stats := issues.ComposeWithStats(provider, filters)
-	resp := map[string]any{
-		"issues": out,
-		"total":  len(out),
-		// total_matched is the uncapped count — i.e. how many issues
-		// would have been in `issues` if no limit applied. Tells the
-		// caller whether they're looking at a windowed view or the
-		// whole set. The hub forwards this per-cluster in fleet
-		// envelopes so the SPA can render "X of N total".
-		"total_matched": stats.TotalMatched,
-	}
+	// Shared response shape (issues.ListResponse) so /api/issues and the MCP
+	// issues tool can't drift; the hub mirrors one shape.
+	resp := issues.NewListResponse(out, stats)
 	if result := k8s.GetCachedPermissionResult(); result != nil {
 		if visibility := k8s.BuildVisibilitySummary(result, k8s.VisibilityNamespace(namespaces)); visibility != nil {
-			resp["visibility"] = visibility
+			resp.Visibility = visibility
 		}
-	}
-	if stats.FilterErrors > 0 {
-		resp["filter_errors"] = stats.FilterErrors
-		resp["filter_error_sample"] = stats.FilterErrorSample
 	}
 	s.writeJSON(w, resp)
 }

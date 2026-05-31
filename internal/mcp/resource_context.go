@@ -73,42 +73,25 @@ func computeMCPIssueSummary(cache *k8s.ResourceCache, group, kind, namespace, na
 	if provider == nil {
 		return nil
 	}
-	filters := issues.Filters{
-		Kinds: []string{kind},
-		// NoLimit (not MaxLimit): the post-compose filter narrows to a
-		// single {group, kind, ns, name}, so a hard cap before that
-		// filter can silently drop the target resource's rows when the
-		// kind has many same-namespace siblings whose issues outrank
-		// the target on (severity, last_seen). Mirrors
-		// summarycontext.BuildIssueIndex's identical rationale.
-		Limit: issues.NoLimit,
-	}
+	var namespaces []string
 	if namespace != "" {
-		filters.Namespaces = []string{namespace}
+		namespaces = []string{namespace}
 	}
-	rows, _ := issues.ComposeWithStats(provider, filters)
-
-	matched := make([]issues.Issue, 0, len(rows))
-	bySource := make(map[string]int)
-	for _, row := range rows {
-		if row.Name != name {
-			continue
-		}
-		if namespace != "" && row.Namespace != namespace {
-			continue
-		}
-		if row.Group != group {
-			continue
-		}
-		matched = append(matched, row)
-		bySource[string(row.Source)]++
-	}
+	// RelatedIssues is owner-aware and uncapped: get_resource on a workload
+	// surfaces the GROUPED issues its pods are evidence for (was empty — the
+	// old flat-by-exact-resource match looked for Kind=Deployment rows, but the
+	// evidence is Kind=Pod), and on a pod past the inline-Members cap too.
+	matched := issues.RelatedIssues(provider, namespaces, group, kind, namespace, name)
 	if len(matched) == 0 {
 		return nil
 	}
+	bySource := make(map[string]int, len(matched))
+	for _, row := range matched {
+		bySource[string(row.Source)]++
+	}
 	// (severity desc, Reason asc) — deterministic across runs.
 	sort.Slice(matched, func(i, j int) bool {
-		ri, rj := mcpComposeSeverityRank(matched[i].Severity), mcpComposeSeverityRank(matched[j].Severity)
+		ri, rj := issues.SeverityRank(matched[i].Severity), issues.SeverityRank(matched[j].Severity)
 		if ri != rj {
 			return ri > rj
 		}
@@ -120,16 +103,6 @@ func computeMCPIssueSummary(cache *k8s.ResourceCache, group, kind, namespace, na
 		TopReason:       matched[0].Reason,
 		BySource:        bySource,
 	}
-}
-
-func mcpComposeSeverityRank(s issues.Severity) int {
-	switch s {
-	case issues.SeverityCritical:
-		return 2
-	case issues.SeverityWarning:
-		return 1
-	}
-	return 0
 }
 
 // computeMCPAuditSummary looks up audit findings for the subject resource
@@ -230,4 +203,3 @@ func mcpTopologyForContext(namespace string) (*topo.Topology, topo.ResourceProvi
 	}
 	return topology, provider, dyn, true
 }
-

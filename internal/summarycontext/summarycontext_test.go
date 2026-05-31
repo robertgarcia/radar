@@ -31,10 +31,10 @@ import (
 // behavior — needed so the cluster-scoped-filter regression test can
 // pin the actual bug.
 type fakeIssuesProvider struct {
-	problems []k8s.Problem
+	problems []k8s.Detection
 }
 
-func (f *fakeIssuesProvider) DetectProblems(namespaces []string) []k8s.Problem {
+func (f *fakeIssuesProvider) DetectProblems(namespaces []string) []k8s.Detection {
 	if len(namespaces) == 0 {
 		return f.problems
 	}
@@ -42,7 +42,7 @@ func (f *fakeIssuesProvider) DetectProblems(namespaces []string) []k8s.Problem {
 	for _, ns := range namespaces {
 		allowed[ns] = true
 	}
-	out := make([]k8s.Problem, 0, len(f.problems))
+	out := make([]k8s.Detection, 0, len(f.problems))
 	for _, p := range f.problems {
 		if p.Namespace == "" {
 			continue
@@ -53,9 +53,10 @@ func (f *fakeIssuesProvider) DetectProblems(namespaces []string) []k8s.Problem {
 	}
 	return out
 }
-func (f *fakeIssuesProvider) DetectCAPIProblems(_ []string) []k8s.Problem { return nil }
-func (f *fakeIssuesProvider) DetectMissingRefs(_ []string) []k8s.Problem  { return nil }
-func (f *fakeIssuesProvider) DetectScheduling(_ []string) []k8s.Problem   { return nil }
+func (f *fakeIssuesProvider) DetectCAPIProblems(_ []string) []k8s.Detection   { return nil }
+func (f *fakeIssuesProvider) DetectGitOpsProblems(_ []string) []k8s.Detection { return nil }
+func (f *fakeIssuesProvider) DetectMissingRefs(_ []string) []k8s.Detection    { return nil }
+func (f *fakeIssuesProvider) DetectScheduling(_ []string) []k8s.Detection     { return nil }
 func (f *fakeIssuesProvider) WarningEvents(_ []string, _ time.Duration) []*corev1.Event {
 	return nil
 }
@@ -63,9 +64,12 @@ func (f *fakeIssuesProvider) WatchedDynamic() []schema.GroupVersionResource { re
 func (f *fakeIssuesProvider) ListDynamic(_ schema.GroupVersionResource, _ string) ([]*unstructured.Unstructured, error) {
 	return nil, nil
 }
-func (f *fakeIssuesProvider) KindForGVR(_ schema.GroupVersionResource) string { return "" }
+func (f *fakeIssuesProvider) ListDynamicAllNamespaces(_ schema.GroupVersionResource) ([]*unstructured.Unstructured, error) {
+	return nil, nil
+}
+func (f *fakeIssuesProvider) KindForGVR(_ schema.GroupVersionResource) string  { return "" }
 func (f *fakeIssuesProvider) KyvernoFindings() []policyreports.SubjectFindings { return nil }
-func (f *fakeIssuesProvider) KyvernoStatus() string                              { return "" }
+func (f *fakeIssuesProvider) KyvernoStatus() string                            { return "" }
 
 func fmtPodName(i int) string { return fmt.Sprintf("pod-%05d", i) }
 
@@ -102,18 +106,44 @@ func TestBuildIssueIndex_GroupAware(t *testing.T) {
 	// Inject via a fake issues.Provider rather than the cache plumbing —
 	// keeps the test focused on the index-key arithmetic.
 	p := &fakeIssuesProvider{
-		problems: []k8s.Problem{
+		problems: []k8s.Detection{
 			{Kind: "Service", Group: "", Namespace: "prod", Name: "api", Reason: "Endpoints", Severity: "warning"},
 			{Kind: "Service", Group: "serving.knative.dev", Namespace: "prod", Name: "api", Reason: "RevisionFailed", Severity: "warning"},
 			{Kind: "Service", Group: "serving.knative.dev", Namespace: "prod", Name: "api", Reason: "RouteNotReady", Severity: "warning"},
 		},
 	}
 	idx := BuildIssueIndex(p, nil)
+	// The index counts GROUPED issues (consistent with the issues tool), not flat
+	// rows: the two Knative rows share subject+category and fold into one grouped
+	// issue → count 1. The core Service is a distinct group → its own key (the
+	// group-awareness this test pins: the two never coalesce across API groups).
 	if got := idx.Count("", "Service", "prod", "api"); got != 1 {
 		t.Errorf("core Service count = %d, want 1", got)
 	}
-	if got := idx.Count("serving.knative.dev", "Service", "prod", "api"); got != 2 {
-		t.Errorf("Knative Service count = %d, want 2", got)
+	if got := idx.Count("serving.knative.dev", "Service", "prod", "api"); got != 1 {
+		t.Errorf("Knative Service count = %d, want 1 (two same-category rows fold to one grouped issue)", got)
+	}
+}
+
+// TestBuildIssueIndex_GroupedSubjectPropagation is the contract that ties the
+// issues tool to resource drill-down: a Pod-evidenced issue grouped under a
+// Deployment must surface on BOTH the Deployment (the grouped subject an agent
+// sees in `issues` and queries via get_resource) AND the Pod (the evidence).
+// Before the grouped index, the Deployment read issueCount=0 — the drill-down
+// contradicted the entry point.
+func TestBuildIssueIndex_GroupedSubjectPropagation(t *testing.T) {
+	p := &fakeIssuesProvider{
+		problems: []k8s.Detection{
+			{Kind: "Pod", Namespace: "prod", Name: "web-abc-1", Reason: "CrashLoopBackOff", Severity: "critical",
+				OwnerGroup: "apps", OwnerKind: "Deployment", OwnerName: "web"},
+		},
+	}
+	idx := BuildIssueIndex(p, nil)
+	if got := idx.Count("apps", "Deployment", "prod", "web"); got != 1 {
+		t.Errorf("owning Deployment count = %d, want 1 (Pod-evidenced issue must surface on the grouped subject)", got)
+	}
+	if got := idx.Count("", "Pod", "prod", "web-abc-1"); got != 1 {
+		t.Errorf("evidence Pod count = %d, want 1", got)
 	}
 }
 
@@ -124,9 +154,9 @@ func TestBuildIssueIndex_GroupAware(t *testing.T) {
 // out counts for tail resources. The fix is Limit:NoLimit — the index
 // is a bucketed count, not a paginated list.
 func TestBuildIssueIndex_BeyondMaxLimit(t *testing.T) {
-	probs := make([]k8s.Problem, 0, issues.MaxLimit+50)
+	probs := make([]k8s.Detection, 0, issues.MaxLimit+50)
 	for i := 0; i < issues.MaxLimit+50; i++ {
-		probs = append(probs, k8s.Problem{
+		probs = append(probs, k8s.Detection{
 			Kind: "Pod", Namespace: "prod", Name: fmtPodName(i), Reason: "ImagePullBackOff", Severity: "warning",
 		})
 	}
@@ -167,7 +197,7 @@ func TestCanonicalSingular(t *testing.T) {
 // dropped because Compose's per-namespace problem walk never sees them.
 func TestBuildIssueIndex_ClusterScopedIssueSurfacedWhenUnfiltered(t *testing.T) {
 	p := &fakeIssuesProvider{
-		problems: []k8s.Problem{
+		problems: []k8s.Detection{
 			// Cluster-scoped Node issue: namespace="" — the actual shape
 			// k8s.DetectProblems emits for NodeNotReady / DiskPressure etc.
 			{Kind: "Node", Namespace: "", Name: "worker-1", Reason: "NotReady", Severity: "critical"},
@@ -205,7 +235,7 @@ func TestBuildIssueIndex_ClusterScopedIssueSurfacedWhenUnfiltered(t *testing.T) 
 // Kind (Pascal "Application") so the index and the query agree.
 func TestBuildIssueIndex_CRDPlural_NonZeroCount(t *testing.T) {
 	p := &fakeIssuesProvider{
-		problems: []k8s.Problem{
+		problems: []k8s.Detection{
 			{Kind: "Application", Group: "argoproj.io", Namespace: "argocd", Name: "storefront", Reason: "SyncFailed", Severity: "critical"},
 		},
 	}
@@ -239,7 +269,7 @@ func TestBuildIssueIndex_CRDPlural_NonZeroCount(t *testing.T) {
 // filter drops them.
 func TestNewSearchSummaryContextBuilder_BuildsDualIndex(t *testing.T) {
 	p := &fakeIssuesProvider{
-		problems: []k8s.Problem{
+		problems: []k8s.Detection{
 			{Kind: "Node", Group: "", Namespace: "", Name: "worker-1", Reason: "NotReady", Severity: "critical"},
 			{Kind: "Pod", Group: "", Namespace: "prod", Name: "api-7", Reason: "ImagePullBackOff", Severity: "warning"},
 		},

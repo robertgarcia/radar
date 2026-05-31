@@ -483,7 +483,7 @@ type issuesInput struct {
 	Severity  string `json:"severity,omitempty" jsonschema:"comma-separated: critical,warning"`
 	Kind      string `json:"kind,omitempty" jsonschema:"comma-separated kind filter (e.g. Deployment,Pod)"`
 	Limit     int    `json:"limit,omitempty" jsonschema:"max issues returned (default 200, max 1000)"`
-	Filter    string `json:"filter,omitempty" jsonschema:"optional CEL boolean expression run against each composed Issue. Bindings: severity, source (the detector that found it: problem|missing_ref|scheduling|condition), kind, group, ns (the namespace — note: use 'ns' not 'namespace' because the latter is a CEL reserved word), name, reason, message, count (int), cluster, last_seen (unix seconds). Examples: 'severity == \"critical\" && count > 5', 'source == \"condition\" && ns.startsWith(\"prod-\")'"`
+	Filter    string `json:"filter,omitempty" jsonschema:"optional CEL boolean expression run against each composed Issue. Bindings: severity (critical|warning), category (e.g. crashloop, image_pull_failed, missing_config_ref, gitops_sync_failed), category_group (startup|runtime|scheduling|configuration|networking|storage|scaling|security|control_plane), source (problem|missing_ref|scheduling|condition), kind, group, ns (the namespace — use 'ns', not 'namespace' which is a CEL reserved word), name, reason, message, count (int, the affected-resource fan-out), grouping_scope (workload|service|node|…), restart_count (int), last_terminated_reason, first_seen + last_seen (unix seconds — prefer first_seen for onset/age; last_seen churns to compose-time). For cross-cluster scoping use clusters= (not a CEL predicate). Examples: 'severity == \"critical\" && count > 5', 'category_group == \"startup\"', 'restart_count > 10', 'first_seen < timestamp(\"2026-05-01T00:00:00Z\").getSeconds()'"`
 }
 
 // Tool handlers
@@ -2399,7 +2399,9 @@ func handleIssuesTool(ctx context.Context, _ *mcp.CallToolRequest, input issuesI
 	var allowedNamespaces []string
 	if input.Namespace != "" {
 		if !checkNamespaceAccess(ctx, input.Namespace) {
-			return toJSONResult(map[string]any{"issues": []issues.Issue{}, "total": 0, "total_matched": 0})
+			// Explicit denial must NOT read as "[] = nothing broken" — for an
+			// agent that's an unauthorized → healthy trust gap. Surface it.
+			return nil, nil, fmt.Errorf("forbidden: no access to namespace %q", input.Namespace)
 		}
 		allowedNamespaces = []string{input.Namespace}
 	} else {
@@ -2417,6 +2419,10 @@ func handleIssuesTool(ctx context.Context, _ *mcp.CallToolRequest, input issuesI
 		Kinds:      splitCSVStr(input.Kind),
 		Limit:      input.Limit,
 		Namespaces: allowedNamespaces,
+		// Agents get the grouped issue model — structured triage objects,
+		// not per-pod evidence rows they'd have to re-aggregate. Raw object
+		// state stays available via get_resource / get_events.
+		Grouped: true,
 		CanReadClusterScoped: func(kind, group string) bool {
 			return canReadClusterScopedKind(ctx, kind, group, "list")
 		},
@@ -2429,30 +2435,20 @@ func handleIssuesTool(ctx context.Context, _ *mcp.CallToolRequest, input issuesI
 		filters.Filter = f
 	}
 	out, stats := issues.ComposeWithStats(provider, filters)
-	resp := map[string]any{
-		"issues": out,
-		"total":  len(out),
-		// total_matched is the uncapped count — tells the caller
-		// whether the response is windowed or the whole set. Without
-		// it, an MCP agent can't distinguish "200 returned" from
-		// "200 of 1000". Mirrors the HTTP /api/issues response shape.
-		"total_matched": stats.TotalMatched,
-	}
-	// Steering hint when the issue list was capped.
+	// Shared response shape (issues.ListResponse) — identical to /api/issues so
+	// HTTP and MCP can't drift.
+	resp := issues.NewListResponse(out, stats)
+	// Steering hint when the issue list was capped (MCP-only).
 	if stats.TotalMatched > len(out) {
-		resp["narrowHint"] = fmt.Sprintf(
+		resp.NarrowHint = fmt.Sprintf(
 			"returned %d of %d issues — narrow with namespace=, kind=, severity=critical, add filter= CEL, or raise limit (cap 1000)",
 			len(out), stats.TotalMatched,
 		)
 	}
 	if result := k8s.GetCachedPermissionResult(); result != nil {
 		if visibility := k8s.BuildVisibilitySummary(result, k8s.VisibilityNamespace(allowedNamespaces)); visibility != nil {
-			resp["visibility"] = visibility
+			resp.Visibility = visibility
 		}
-	}
-	if stats.FilterErrors > 0 {
-		resp["filter_errors"] = stats.FilterErrors
-		resp["filter_error_sample"] = stats.FilterErrorSample
 	}
 	return toJSONResult(resp)
 }

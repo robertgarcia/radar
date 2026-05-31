@@ -6,7 +6,9 @@ import (
 	"strings"
 
 	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 )
 
 const (
@@ -92,8 +94,9 @@ type TopWorkloadMetrics struct {
 }
 
 type TopOwnerInfo struct {
-	Kind string `json:"kind"`
-	Name string `json:"name"`
+	Group string `json:"group,omitempty"`
+	Kind  string `json:"kind"`
+	Name  string `json:"name"`
 }
 
 func NormalizeTopMetricsOptions(opts TopMetricsOptions) TopMetricsOptions {
@@ -216,7 +219,7 @@ func buildTopPodItems(store *MetricsHistoryStore, namespace string) (items []Top
 			skippedNoMetrics++
 			continue
 		}
-		entry := topPodFromObject(pod)
+		entry := topPodFromObject(cache, pod)
 		applyPodUsage(&entry, m)
 		items = append(items, entry)
 	}
@@ -384,7 +387,7 @@ func topNodeMetricsOnly(m TopNodeMetrics) TopMetricsItem {
 	}
 }
 
-func topPodFromObject(pod *corev1.Pod) TopMetricsItem {
+func topPodFromObject(cache *ResourceCache, pod *corev1.Pod) TopMetricsItem {
 	item := TopMetricsItem{
 		Kind:      "Pod",
 		Namespace: pod.Namespace,
@@ -393,7 +396,7 @@ func topPodFromObject(pod *corev1.Pod) TopMetricsItem {
 		Status:    string(pod.Status.Phase),
 		Restarts:  podRestartCount(pod),
 		Node:      pod.Spec.NodeName,
-		Owner:     topOwnerForPod(pod),
+		Owner:     topOwnerForPodResolved(cache, pod),
 	}
 	for _, c := range pod.Spec.Containers {
 		if req, ok := c.Resources.Requests[corev1.ResourceCPU]; ok {
@@ -450,21 +453,56 @@ func nodeReadyStatus(node *corev1.Node) string {
 	return "Unknown"
 }
 
+// topOwnerForPodResolved is the cache-aware owner walk. A pod's controlling
+// ReplicaSet is not necessarily owned by a Deployment — Argo Rollouts and other
+// CRD controllers create ReplicaSets directly. The pod-only topOwnerForPod
+// assumes Deployment for any ReplicaSet, which mislabels those pods as phantom
+// Deployments (broken grouping subject + dead deep-link). This resolves the
+// ReplicaSet to its OWN controller via cache and reports the real owner
+// (Deployment with its true name, an Argo Rollout, a standalone ReplicaSet, …).
+// Falls back to the pod-only heuristic when the ReplicaSet isn't cached.
+func topOwnerForPodResolved(cache *ResourceCache, pod *corev1.Pod) *TopOwnerInfo {
+	ref := controllerOwnerRef(pod.OwnerReferences)
+	if ref == nil {
+		return nil
+	}
+	if ref.Kind == "ReplicaSet" && cache != nil {
+		if rsl := cache.ReplicaSets(); rsl != nil {
+			if rs, err := rsl.ReplicaSets(pod.Namespace).Get(ref.Name); err == nil && rs != nil {
+				if owner := controllerOwnerRef(rs.OwnerReferences); owner != nil {
+					return &TopOwnerInfo{
+						Group: schema.FromAPIVersionAndKind(owner.APIVersion, owner.Kind).Group,
+						Kind:  owner.Kind,
+						Name:  owner.Name,
+					}
+				}
+				// A ReplicaSet with no controller owner is its own top owner.
+				return &TopOwnerInfo{Group: "apps", Kind: "ReplicaSet", Name: ref.Name}
+			}
+		}
+	}
+	return topOwnerForPod(pod)
+}
+
+// controllerOwnerRef returns the controller=true ownerReference. Non-controller
+// ownerRefs are descriptive, not identity, and must not group issues.
+func controllerOwnerRef(refs []metav1.OwnerReference) *metav1.OwnerReference {
+	for i := range refs {
+		if refs[i].Controller != nil && *refs[i].Controller {
+			return &refs[i]
+		}
+	}
+	return nil
+}
+
 func topOwnerForPod(pod *corev1.Pod) *TopOwnerInfo {
 	for _, ref := range pod.OwnerReferences {
 		if ref.Controller != nil && *ref.Controller {
 			if ref.Kind == "ReplicaSet" {
-				return &TopOwnerInfo{Kind: "Deployment", Name: stripReplicaSetHash(ref.Name)}
+				return &TopOwnerInfo{Group: "apps", Kind: "Deployment", Name: stripReplicaSetHash(ref.Name)}
 			}
-			return &TopOwnerInfo{Kind: ref.Kind, Name: ref.Name}
+			return &TopOwnerInfo{Group: schema.FromAPIVersionAndKind(ref.APIVersion, ref.Kind).Group, Kind: ref.Kind, Name: ref.Name}
 		}
-	}
-	if len(pod.OwnerReferences) > 0 {
-		ref := pod.OwnerReferences[0]
-		if ref.Kind == "ReplicaSet" {
-			return &TopOwnerInfo{Kind: "Deployment", Name: stripReplicaSetHash(ref.Name)}
-		}
-		return &TopOwnerInfo{Kind: ref.Kind, Name: ref.Name}
 	}
 	return nil
 }

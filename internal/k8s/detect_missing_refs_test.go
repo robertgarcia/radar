@@ -206,7 +206,7 @@ func TestDetectMissingRefs(t *testing.T) {
 	// 4 from the new ones (imagePullSecret, headless Service, TLS Secret,
 	// backend port match).
 	deadline := time.Now().Add(2 * time.Second)
-	var problems []Problem
+	var problems []Detection
 	for time.Now().Before(deadline) {
 		problems = DetectMissingRefs(cache, "")
 		if len(problems) >= 12 {
@@ -280,17 +280,216 @@ func TestDetectMissingRefs(t *testing.T) {
 		}
 	}
 
-	// TLS-secret-missing must be `warning`, not `critical` — Ingress
-	// controller falls back to default cert, degraded but not broken.
-	// All other missing-ref problems must stay `critical`.
+	// Severity is calibrated to impact, not blanket-critical. Refs that break a
+	// running thing now stay critical; latent/inert ones are de-escalated:
+	//   - Missing TLS Secret → warning (controller falls back to default cert)
+	//   - Missing headless Service on a single-replica STS → info (no peers, inert)
+	//   - Missing roleRef target → warning (dangling binding grants nothing)
 	for _, p := range problems {
-		if p.Reason == "Missing TLS Secret" {
-			if p.Severity != "warning" {
-				t.Errorf("TLS-secret-missing should be warning severity, got %q: %+v", p.Severity, p)
-			}
-		} else if p.Severity != "critical" {
-			t.Errorf("non-TLS missing-ref should be critical severity, got %q: %+v", p.Severity, p)
+		var wantSev string
+		switch p.Reason {
+		case "Missing TLS Secret":
+			wantSev = "warning"
+		case "Missing headless Service":
+			wantSev = "info" // sts-bad has nil replicas → treated as 1
+		case "Missing roleRef target":
+			wantSev = "warning"
+		default:
+			wantSev = "critical"
 		}
+		if p.Severity != wantSev {
+			t.Errorf("reason %q: severity = %q, want %q: %+v", p.Reason, p.Severity, wantSev, p)
+		}
+	}
+}
+
+func TestDetectPodMissingRefs_SkipsTerminalPods(t *testing.T) {
+	defer ResetTestState()
+	now := metav1.NewTime(time.Now().Add(-10 * time.Minute))
+	mkPod := func(name string, phase corev1.PodPhase) *corev1.Pod {
+		return &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "prod", CreationTimestamp: now},
+			Spec:       corev1.PodSpec{ServiceAccountName: "missing-sa"},
+			Status:     corev1.PodStatus{Phase: phase},
+		}
+	}
+	client := fake.NewClientset(
+		mkPod("live", corev1.PodRunning),
+		mkPod("done", corev1.PodSucceeded),
+		mkPod("failed", corev1.PodFailed),
+	)
+	if err := InitTestResourceCache(client); err != nil {
+		t.Fatalf("InitTestResourceCache: %v", err)
+	}
+	cache := GetResourceCache()
+	deadline := time.Now().Add(2 * time.Second)
+	flagged := map[string]bool{}
+	for time.Now().Before(deadline) {
+		flagged = map[string]bool{}
+		for _, p := range DetectMissingRefs(cache, "") {
+			if p.Reason == "Missing ServiceAccount" {
+				flagged[p.Name] = true
+			}
+		}
+		if flagged["live"] {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if !flagged["live"] {
+		t.Error("running pod with a missing ServiceAccount should be flagged")
+	}
+	if flagged["done"] || flagged["failed"] {
+		t.Errorf("terminal pods (Succeeded/Failed) must be skipped by missing-ref detection: %+v", flagged)
+	}
+}
+
+func TestDetectPodMissingRefs_OwnerGrouped(t *testing.T) {
+	defer ResetTestState()
+	now := metav1.NewTime(time.Now().Add(-10 * time.Minute))
+	tru := true
+	rs := &appsv1.ReplicaSet{ObjectMeta: metav1.ObjectMeta{
+		Name: "web-abc", Namespace: "prod", CreationTimestamp: now,
+		OwnerReferences: []metav1.OwnerReference{{APIVersion: "apps/v1", Kind: "Deployment", Name: "web", Controller: &tru}},
+	}}
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "web-abc-1", Namespace: "prod", CreationTimestamp: now,
+			OwnerReferences: []metav1.OwnerReference{{Kind: "ReplicaSet", Name: "web-abc", Controller: &tru}},
+		},
+		Spec: corev1.PodSpec{Containers: []corev1.Container{{
+			Name:    "c",
+			EnvFrom: []corev1.EnvFromSource{{ConfigMapRef: &corev1.ConfigMapEnvSource{LocalObjectReference: corev1.LocalObjectReference{Name: "nope"}}}},
+		}}},
+		Status: corev1.PodStatus{Phase: corev1.PodRunning},
+	}
+	client := fake.NewClientset(rs, pod)
+	if err := InitTestResourceCache(client); err != nil {
+		t.Fatalf("InitTestResourceCache: %v", err)
+	}
+	cache := GetResourceCache()
+	deadline := time.Now().Add(2 * time.Second)
+	var got *Detection
+	for time.Now().Before(deadline) {
+		got = nil
+		for _, p := range DetectMissingRefs(cache, "") {
+			if p.Kind == "Pod" && p.Reason == "Missing ConfigMap" {
+				pp := p
+				got = &pp
+			}
+		}
+		if got != nil && got.OwnerKind != "" {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if got == nil {
+		t.Fatal("expected a Missing ConfigMap pod problem")
+	}
+	if got.OwnerGroup != "apps" || got.OwnerKind != "Deployment" || got.OwnerName != "web" {
+		t.Errorf("owner = %s/%s/%s, want apps/Deployment/web (pod missing-refs must fold under the workload)", got.OwnerGroup, got.OwnerKind, got.OwnerName)
+	}
+}
+
+func TestTopOwnerForPodResolved(t *testing.T) {
+	defer ResetTestState()
+	tru := true
+	depRS := &appsv1.ReplicaSet{ObjectMeta: metav1.ObjectMeta{
+		Name: "web-abc123", Namespace: "ns",
+		OwnerReferences: []metav1.OwnerReference{{APIVersion: "apps/v1", Kind: "Deployment", Name: "web", Controller: &tru}},
+	}}
+	rolloutRS := &appsv1.ReplicaSet{ObjectMeta: metav1.ObjectMeta{
+		Name: "canary-xyz789", Namespace: "ns",
+		OwnerReferences: []metav1.OwnerReference{{APIVersion: "argoproj.io/v1alpha1", Kind: "Rollout", Name: "canary", Controller: &tru}},
+	}}
+	client := fake.NewClientset(depRS, rolloutRS)
+	if err := InitTestResourceCache(client); err != nil {
+		t.Fatalf("InitTestResourceCache: %v", err)
+	}
+	cache := GetResourceCache()
+	mkPod := func(rs string) *corev1.Pod {
+		return &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
+			Namespace:       "ns",
+			OwnerReferences: []metav1.OwnerReference{{Kind: "ReplicaSet", Name: rs, Controller: &tru}},
+		}}
+	}
+	// Wait for the ReplicaSet informer to populate (resolver returns the real
+	// Deployment once cached; before that it falls back to the hash-strip guess).
+	deadline := time.Now().Add(2 * time.Second)
+	var dep *TopOwnerInfo
+	for time.Now().Before(deadline) {
+		dep = topOwnerForPodResolved(cache, mkPod("web-abc123"))
+		if dep != nil && dep.Name == "web" {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if dep == nil || dep.Kind != "Deployment" || dep.Name != "web" {
+		t.Errorf("Deployment-owned pod resolved to %+v, want Deployment/web", dep)
+	}
+	ro := topOwnerForPodResolved(cache, mkPod("canary-xyz789"))
+	if ro == nil || ro.Kind != "Rollout" || ro.Name != "canary" || ro.Group != "argoproj.io" {
+		t.Errorf("Rollout-owned pod resolved to %+v, want argoproj.io/Rollout/canary (NOT a phantom Deployment)", ro)
+	}
+}
+
+func TestDanglingRoleBindingSeverity(t *testing.T) {
+	cases := []struct {
+		name, binding, roleRef, want string
+	}{
+		{"ordinary dangling binding is warning", "my-app-binding", "missing-role", "warning"},
+		{"GKE PSP residue by binding name is info", "gce:podsecuritypolicy:privileged", "gce:podsecuritypolicy:privileged", "info"},
+		{"GKE PSP residue by roleRef name is info", "some-binding", "gce:podsecuritypolicy:unprivileged", "info"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := danglingRoleBindingSeverity(c.binding, c.roleRef); got != c.want {
+				t.Errorf("danglingRoleBindingSeverity(%q,%q) = %q, want %q", c.binding, c.roleRef, got, c.want)
+			}
+		})
+	}
+}
+
+// TestStatefulSetHeadlessServiceSeverity pins the replica-aware calibration:
+// a missing headless Service is inert (info) for a single-replica StatefulSet
+// but a real peer-DNS degradation (warning) for a multi-replica one.
+func TestStatefulSetHeadlessServiceSeverity(t *testing.T) {
+	defer ResetTestState()
+	now := metav1.NewTime(time.Now().Add(-5 * time.Minute))
+	three := int32(3)
+	single := &appsv1.StatefulSet{
+		ObjectMeta: metav1.ObjectMeta{Name: "sts-single", Namespace: "prod", CreationTimestamp: now},
+		Spec:       appsv1.StatefulSetSpec{ServiceName: "missing-headless"},
+	}
+	multi := &appsv1.StatefulSet{
+		ObjectMeta: metav1.ObjectMeta{Name: "sts-multi", Namespace: "prod", CreationTimestamp: now},
+		Spec:       appsv1.StatefulSetSpec{ServiceName: "missing-headless", Replicas: &three},
+	}
+	client := fake.NewClientset(single, multi)
+	if err := InitTestResourceCache(client); err != nil {
+		t.Fatalf("InitTestResourceCache: %v", err)
+	}
+	cache := GetResourceCache()
+
+	deadline := time.Now().Add(2 * time.Second)
+	var got map[string]string
+	for time.Now().Before(deadline) {
+		got = map[string]string{}
+		for _, p := range DetectMissingRefs(cache, "") {
+			if p.Kind == "StatefulSet" && p.Reason == "Missing headless Service" {
+				got[p.Name] = p.Severity
+			}
+		}
+		if len(got) >= 2 {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if got["sts-single"] != "info" {
+		t.Errorf("single-replica STS severity = %q, want info", got["sts-single"])
+	}
+	if got["sts-multi"] != "warning" {
+		t.Errorf("multi-replica STS severity = %q, want warning", got["sts-multi"])
 	}
 }
 
@@ -403,7 +602,7 @@ func webhookWithURL(name string) map[string]any {
 
 // --- helpers ---
 
-func findProblem(ps []Problem, kind, ns, name, reason string) bool {
+func findProblem(ps []Detection, kind, ns, name, reason string) bool {
 	for _, p := range ps {
 		if p.Kind == kind && p.Namespace == ns && p.Name == name && p.Reason == reason {
 			return true

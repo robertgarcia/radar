@@ -17,6 +17,7 @@ import { HelmView } from './components/helm/HelmView'
 import { TrafficView } from './components/traffic/TrafficView'
 import { CostView } from './components/cost/CostView'
 import { AuditView } from './components/audit/AuditView'
+import { IssuesPane } from './components/issues/IssuesPane'
 import { GitOpsView } from './components/gitops/GitOpsView'
 import { HelmReleaseDrawer } from './components/helm/HelmReleaseDrawer'
 import { PortForwardProvider, PortForwardIndicator, PortForwardPanel } from './components/portforward/PortForwardManager'
@@ -92,7 +93,7 @@ const FLEET_MODE_KINDS = new Set<NodeKind>([
 
 // Convert API resource name back to topology node ID prefix
 // Extended MainView type that includes traffic and cost
-type ExtendedMainView = MainView | 'traffic' | 'cost' | 'workload' | 'audit' | 'gitops' | 'compare'
+type ExtendedMainView = MainView | 'traffic' | 'cost' | 'workload' | 'audit' | 'gitops' | 'compare' | 'issues'
 
 // Extract view from URL path
 function getViewFromPath(pathname: string): ExtendedMainView {
@@ -108,6 +109,7 @@ function getViewFromPath(pathname: string): ExtendedMainView {
   if (path === 'audit') return 'audit'
   if (path === 'gitops') return 'gitops'
   if (path === 'compare') return 'compare'
+  if (path === 'issues') return 'issues'
   return 'home'
 }
 
@@ -392,6 +394,27 @@ function AppInner() {
       update()
     }
   }, [selectedResource])
+
+  // Navigate from a detector finding (Audit / Issues) to the resources list for
+  // its kind, opening the resource. Shared by both queues — the body was
+  // duplicated verbatim at each render site. Encodes the opened resource in the
+  // URL (?resource=ns/name) — the same deep-link shape the resources view
+  // round-trips — so refresh/share keeps the drawer open instead of dropping it.
+  const navigateToResourceList = useCallback((resource: SelectedResource) => {
+    const pluralKind = kindToPlural(resource.kind)
+    setSelectedResource({ ...resource, kind: pluralKind })
+    const newParams = new URLSearchParams(searchParams)
+    newParams.delete('kind')
+    newParams.delete('mode')
+    newParams.delete('group')
+    newParams.set('resource', resource.namespace ? `${resource.namespace}/${resource.name}` : resource.name)
+    if (resource.group) {
+      newParams.set('apiGroup', resource.group)
+    } else {
+      newParams.delete('apiGroup')
+    }
+    navigate({ pathname: `/resources/${pluralKind}`, search: newParams.toString() })
+  }, [searchParams, navigate])
 
   // Collapse from expanded WorkloadView back to drawer
   const handleCollapseFromExpanded = useCallback(() => {
@@ -1638,21 +1661,18 @@ function AppInner() {
           <AuditView
             namespaces={namespaces}
             onBack={() => setMainView('home')}
-            onNavigateToResource={(resource) => {
-              const pluralKind = kindToPlural(resource.kind)
-              setSelectedResource({ ...resource, kind: pluralKind })
-              const newParams = new URLSearchParams(searchParams)
-              newParams.delete('kind')
-              newParams.delete('mode')
-              newParams.delete('group')
-              newParams.delete('resource')
-              if (resource.group) {
-                newParams.set('apiGroup', resource.group)
-              } else {
-                newParams.delete('apiGroup')
-              }
-              navigate({ pathname: `/resources/${pluralKind}`, search: newParams.toString() })
-            }}
+            onNavigateToResource={navigateToResourceList}
+          />
+        )}
+
+        {/* Issues — per-cluster live triage queue (hidden route: not yet in the
+            nav `views` list; reachable at /issues). Same shared <IssuesView> the
+            Hub fleet uses; resource clicks open the standard resource drawer. */}
+        {mainView === 'issues' && (
+          <IssuesPane
+            namespaces={namespaces}
+            onBack={() => setMainView('home')}
+            onNavigateToResource={navigateToResourceList}
           />
         )}
 
